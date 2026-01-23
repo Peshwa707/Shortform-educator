@@ -1,75 +1,142 @@
-// Database client for PostgreSQL (Railway deployment)
-// Migrated from sql.js/SQLite to postgres for persistent storage
+// Database client - supports both SQLite (local) and PostgreSQL (production)
+// Uses SQLite when DATABASE_URL is not set, PostgreSQL when it is
 
 import { Source, MicroLesson, Flashcard, Progress, SourceType } from '@/types';
 import { nanoid } from 'nanoid';
-import postgres from 'postgres';
 import fs from 'fs';
 import path from 'path';
 
-// Connection pool - uses DATABASE_URL from environment
-const connectionString = process.env.DATABASE_URL;
+// Detect which database to use
+const usePostgres = !!process.env.DATABASE_URL;
 
-// Create postgres client with connection pooling
-const sql = connectionString
-  ? postgres(connectionString, {
-      max: 10, // Maximum connections in pool
-      idle_timeout: 20, // Close idle connections after 20 seconds
-      connect_timeout: 10, // Connection timeout in seconds
+// ============================================================================
+// PostgreSQL Setup (when DATABASE_URL is set)
+// ============================================================================
+import postgres from 'postgres';
+
+const sql = usePostgres
+  ? postgres(process.env.DATABASE_URL!, {
+      max: 10,
+      idle_timeout: 20,
+      connect_timeout: 10,
     })
   : null;
 
-// Flag to track if schema has been initialized
+// ============================================================================
+// SQLite Setup (local development fallback)
+// ============================================================================
+import initSqlJs, { Database as SqlJsDatabase, BindParams } from 'sql.js';
+
+const DB_PATH = path.join(process.cwd(), 'data', 'learning.db');
+let sqliteDb: SqlJsDatabase | null = null;
+let SQL: Awaited<ReturnType<typeof initSqlJs>> | null = null;
+
+function ensureDataDir() {
+  const dataDir = path.dirname(DB_PATH);
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+}
+
+async function initSQLite() {
+  if (!SQL) {
+    const wasmPath = path.join(process.cwd(), 'node_modules', 'sql.js', 'dist', 'sql-wasm.wasm');
+    SQL = await initSqlJs({
+      locateFile: () => wasmPath,
+    });
+  }
+  return SQL;
+}
+
+function saveSqliteDb() {
+  if (sqliteDb) {
+    ensureDataDir();
+    const data = sqliteDb.export();
+    const buffer = Buffer.from(data);
+    fs.writeFileSync(DB_PATH, buffer);
+  }
+}
+
+// ============================================================================
+// Initialization
+// ============================================================================
 let schemaInitialized = false;
 
-/**
- * Initialize database schema if not already done
- * Call this once at app startup or first request
- */
 export async function initializeDb(): Promise<void> {
-  if (!sql) {
-    throw new Error('DATABASE_URL environment variable is not set');
-  }
+  if (schemaInitialized) return;
 
-  if (schemaInitialized) {
-    return;
-  }
-
-  // Read and execute schema
-  const schemaPath = path.join(process.cwd(), 'src', 'lib', 'db', 'schema-postgres.sql');
-  const schema = fs.readFileSync(schemaPath, 'utf-8');
-
-  // Split schema into individual statements and execute
-  const statements = schema
-    .split(';')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-
-  for (const statement of statements) {
-    await sql.unsafe(statement);
+  if (usePostgres) {
+    // PostgreSQL initialization
+    const schemaPath = path.join(process.cwd(), 'src', 'lib', 'db', 'schema-postgres.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    const statements = schema.split(';').map((s) => s.trim()).filter((s) => s.length > 0);
+    for (const statement of statements) {
+      await sql!.unsafe(statement);
+    }
+  } else {
+    // SQLite initialization
+    ensureDataDir();
+    const SqlJs = await initSQLite();
+    if (fs.existsSync(DB_PATH)) {
+      const buffer = fs.readFileSync(DB_PATH);
+      sqliteDb = new SqlJs.Database(buffer);
+    } else {
+      sqliteDb = new SqlJs.Database();
+    }
+    const schemaPath = path.join(process.cwd(), 'src', 'lib', 'db', 'schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    sqliteDb.run(schema);
+    saveSqliteDb();
   }
 
   schemaInitialized = true;
 }
 
-/**
- * Get the postgres client (for direct queries if needed)
- * Ensures schema is initialized first
- */
-export async function getDbAsync(): Promise<typeof sql> {
+export async function getDbAsync(): Promise<unknown> {
   await initializeDb();
-  return sql;
+  return usePostgres ? sql : sqliteDb;
 }
 
-// Exported helper for direct queries - now async
+// ============================================================================
+// Helper for direct queries
+// ============================================================================
 export async function getOne<T extends Record<string, unknown>>(
   query: string,
   params: unknown[] = []
 ): Promise<T | undefined> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
-  const result = await sql.unsafe<T[]>(query, params as postgres.ParameterOrJSON<never>[]);
-  return result[0];
+
+  if (usePostgres) {
+    const result = await sql!.unsafe<T[]>(query, params as postgres.ParameterOrJSON<never>[]);
+    return result[0];
+  } else {
+    const stmt = sqliteDb!.prepare(query);
+    stmt.bind(params as BindParams);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return row as T;
+    }
+    stmt.free();
+    return undefined;
+  }
+}
+
+// SQLite helpers
+function sqliteGetAll(query: string, params: unknown[] = []): Record<string, unknown>[] {
+  const stmt = sqliteDb!.prepare(query);
+  stmt.bind(params as BindParams);
+  const rows: Record<string, unknown>[] = [];
+  while (stmt.step()) {
+    rows.push(stmt.getAsObject() as Record<string, unknown>);
+  }
+  stmt.free();
+  return rows;
+}
+
+function sqliteRun(query: string, params: unknown[] = []) {
+  sqliteDb!.run(query, params as BindParams);
+  saveSqliteDb();
 }
 
 // ============================================================================
@@ -83,16 +150,21 @@ export async function createSource(data: {
   filePath?: string;
   rawText?: string;
 }): Promise<Source> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
-
   const id = nanoid();
   const now = new Date().toISOString();
 
-  await sql`
-    INSERT INTO sources (id, type, title, original_url, file_path, raw_text, created_at)
-    VALUES (${id}, ${data.type}, ${data.title}, ${data.originalUrl || null}, ${data.filePath || null}, ${data.rawText || null}, ${now})
-  `;
+  if (usePostgres) {
+    await sql!`
+      INSERT INTO sources (id, type, title, original_url, file_path, raw_text, created_at)
+      VALUES (${id}, ${data.type}, ${data.title}, ${data.originalUrl || null}, ${data.filePath || null}, ${data.rawText || null}, ${now})
+    `;
+  } else {
+    sqliteRun(
+      `INSERT INTO sources (id, type, title, original_url, file_path, raw_text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [id, data.type, data.title, data.originalUrl || null, data.filePath || null, data.rawText || null, now]
+    );
+  }
 
   return {
     id,
@@ -106,55 +178,82 @@ export async function createSource(data: {
 }
 
 export async function getSource(id: string): Promise<Source | null> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
 
-  const rows = await sql`
+  const query = `
     SELECT s.*,
            COUNT(DISTINCT ml.id) as lesson_count,
            COUNT(DISTINCT f.id) as card_count
     FROM sources s
     LEFT JOIN micro_lessons ml ON ml.source_id = s.id
     LEFT JOIN flashcards f ON f.lesson_id = ml.id
-    WHERE s.id = ${id}
+    WHERE s.id = ${usePostgres ? '$1' : '?'}
     GROUP BY s.id
   `;
 
-  if (rows.length === 0) return null;
-  return rowToSource(rows[0] as Record<string, unknown>);
+  if (usePostgres) {
+    const rows = await sql!`
+      SELECT s.*,
+             COUNT(DISTINCT ml.id) as lesson_count,
+             COUNT(DISTINCT f.id) as card_count
+      FROM sources s
+      LEFT JOIN micro_lessons ml ON ml.source_id = s.id
+      LEFT JOIN flashcards f ON f.lesson_id = ml.id
+      WHERE s.id = ${id}
+      GROUP BY s.id
+    `;
+    if (rows.length === 0) return null;
+    return rowToSource(rows[0] as Record<string, unknown>);
+  } else {
+    const rows = sqliteGetAll(
+      `SELECT s.*, COUNT(DISTINCT ml.id) as lesson_count, COUNT(DISTINCT f.id) as card_count
+       FROM sources s
+       LEFT JOIN micro_lessons ml ON ml.source_id = s.id
+       LEFT JOIN flashcards f ON f.lesson_id = ml.id
+       WHERE s.id = ?
+       GROUP BY s.id`,
+      [id]
+    );
+    if (rows.length === 0) return null;
+    return rowToSource(rows[0]);
+  }
 }
 
-/**
- * Get source with raw text - use when you need the full content
- */
 export async function getSourceWithText(id: string): Promise<Source | null> {
-  return getSource(id); // Same query, but named differently for clarity
+  return getSource(id);
 }
 
-/**
- * Get all sources - EXCLUDES raw_text for efficiency (50-90% payload reduction)
- */
 export async function getAllSources(): Promise<Source[]> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
 
-  const rows = await sql`
-    SELECT
-      s.id, s.type, s.title, s.original_url, s.file_path,
-      s.processing_status, s.processing_progress, s.error_message,
-      s.processed_at, s.created_at,
-      COUNT(DISTINCT ml.id) as lesson_count,
-      COUNT(DISTINCT f.id) as card_count
-    FROM sources s
-    LEFT JOIN micro_lessons ml ON ml.source_id = s.id
-    LEFT JOIN flashcards f ON f.lesson_id = ml.id
-    GROUP BY s.id, s.type, s.title, s.original_url, s.file_path,
-             s.processing_status, s.processing_progress, s.error_message,
-             s.processed_at, s.created_at
-    ORDER BY s.created_at DESC
-  `;
-
-  return rows.map((row) => rowToSource(row as Record<string, unknown>));
+  if (usePostgres) {
+    const rows = await sql!`
+      SELECT
+        s.id, s.type, s.title, s.original_url, s.file_path,
+        s.processing_status, s.processing_progress, s.error_message,
+        s.processed_at, s.created_at,
+        COUNT(DISTINCT ml.id) as lesson_count,
+        COUNT(DISTINCT f.id) as card_count
+      FROM sources s
+      LEFT JOIN micro_lessons ml ON ml.source_id = s.id
+      LEFT JOIN flashcards f ON f.lesson_id = ml.id
+      GROUP BY s.id, s.type, s.title, s.original_url, s.file_path,
+               s.processing_status, s.processing_progress, s.error_message,
+               s.processed_at, s.created_at
+      ORDER BY s.created_at DESC
+    `;
+    return rows.map((row) => rowToSource(row as Record<string, unknown>));
+  } else {
+    const rows = sqliteGetAll(
+      `SELECT s.*, COUNT(DISTINCT ml.id) as lesson_count, COUNT(DISTINCT f.id) as card_count
+       FROM sources s
+       LEFT JOIN micro_lessons ml ON ml.source_id = s.id
+       LEFT JOIN flashcards f ON f.lesson_id = ml.id
+       GROUP BY s.id
+       ORDER BY s.created_at DESC`
+    );
+    return rows.map(rowToSource);
+  }
 }
 
 export async function updateSourceStatus(
@@ -163,225 +262,284 @@ export async function updateSourceStatus(
   progress: number,
   errorMessage?: string
 ): Promise<void> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
-
   const processedAt = status === 'complete' ? new Date().toISOString() : null;
 
-  await sql`
-    UPDATE sources
-    SET processing_status = ${status},
-        processing_progress = ${progress},
-        error_message = ${errorMessage || null},
-        processed_at = ${processedAt}
-    WHERE id = ${id}
-  `;
+  if (usePostgres) {
+    await sql!`
+      UPDATE sources
+      SET processing_status = ${status},
+          processing_progress = ${progress},
+          error_message = ${errorMessage || null},
+          processed_at = ${processedAt}
+      WHERE id = ${id}
+    `;
+  } else {
+    sqliteRun(
+      `UPDATE sources SET processing_status = ?, processing_progress = ?, error_message = ?, processed_at = ? WHERE id = ?`,
+      [status, progress, errorMessage || null, processedAt, id]
+    );
+  }
 }
 
 export async function updateSourceRawText(id: string, rawText: string): Promise<void> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
-
-  await sql`UPDATE sources SET raw_text = ${rawText} WHERE id = ${id}`;
+  if (usePostgres) {
+    await sql!`UPDATE sources SET raw_text = ${rawText} WHERE id = ${id}`;
+  } else {
+    sqliteRun(`UPDATE sources SET raw_text = ? WHERE id = ?`, [rawText, id]);
+  }
 }
 
 export async function deleteSource(id: string): Promise<void> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
-
-  await sql`DELETE FROM sources WHERE id = ${id}`;
+  if (usePostgres) {
+    await sql!`DELETE FROM sources WHERE id = ${id}`;
+  } else {
+    sqliteRun(`DELETE FROM sources WHERE id = ?`, [id]);
+  }
 }
 
 // ============================================================================
 // Micro-lesson operations
 // ============================================================================
 
-export async function createMicroLesson(
-  data: Omit<MicroLesson, 'id' | 'createdAt'>
-): Promise<MicroLesson> {
-  if (!sql) throw new Error('Database not initialized');
+export async function createMicroLesson(data: Omit<MicroLesson, 'id' | 'createdAt'>): Promise<MicroLesson> {
   await initializeDb();
-
   const id = nanoid();
   const now = new Date().toISOString();
 
-  await sql`
-    INSERT INTO micro_lessons (id, source_id, sequence, title, hook, content, key_takeaway, estimated_minutes, difficulty, audio_path, created_at)
-    VALUES (${id}, ${data.sourceId}, ${data.sequence}, ${data.title}, ${data.hook}, ${data.content}, ${data.keyTakeaway}, ${data.estimatedMinutes}, ${data.difficulty}, ${data.audioPath || null}, ${now})
-  `;
+  if (usePostgres) {
+    await sql!`
+      INSERT INTO micro_lessons (id, source_id, sequence, title, hook, content, key_takeaway, estimated_minutes, difficulty, audio_path, created_at)
+      VALUES (${id}, ${data.sourceId}, ${data.sequence}, ${data.title}, ${data.hook}, ${data.content}, ${data.keyTakeaway}, ${data.estimatedMinutes}, ${data.difficulty}, ${data.audioPath || null}, ${now})
+    `;
+  } else {
+    sqliteRun(
+      `INSERT INTO micro_lessons (id, source_id, sequence, title, hook, content, key_takeaway, estimated_minutes, difficulty, audio_path, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, data.sourceId, data.sequence, data.title, data.hook, data.content, data.keyTakeaway, data.estimatedMinutes, data.difficulty, data.audioPath || null, now]
+    );
+  }
 
-  return {
-    id,
-    ...data,
-    createdAt: new Date(now),
-  };
+  return { id, ...data, createdAt: new Date(now) };
 }
 
-/**
- * Batch create micro-lessons - uses transaction for 70-80% faster inserts
- */
-export async function createMicroLessons(
-  lessons: Omit<MicroLesson, 'id' | 'createdAt'>[]
-): Promise<MicroLesson[]> {
-  if (!sql) throw new Error('Database not initialized');
+export async function createMicroLessons(lessons: Omit<MicroLesson, 'id' | 'createdAt'>[]): Promise<MicroLesson[]> {
   await initializeDb();
-
   if (lessons.length === 0) return [];
 
   const now = new Date().toISOString();
   const results: MicroLesson[] = [];
 
-  // Use transaction for batch insert
-  await sql.begin(async (tx: postgres.TransactionSql) => {
+  if (usePostgres) {
+    await sql!.begin(async (tx: postgres.TransactionSql) => {
+      for (const lesson of lessons) {
+        const id = nanoid();
+        await tx.unsafe(
+          `INSERT INTO micro_lessons (id, source_id, sequence, title, hook, content, key_takeaway, estimated_minutes, difficulty, audio_path, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+          [id, lesson.sourceId, lesson.sequence, lesson.title, lesson.hook, lesson.content, lesson.keyTakeaway, lesson.estimatedMinutes, lesson.difficulty, lesson.audioPath || null, now]
+        );
+        results.push({ id, ...lesson, createdAt: new Date(now) });
+      }
+    });
+  } else {
     for (const lesson of lessons) {
       const id = nanoid();
-      await tx.unsafe(
+      sqliteDb!.run(
         `INSERT INTO micro_lessons (id, source_id, sequence, title, hook, content, key_takeaway, estimated_minutes, difficulty, audio_path, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [id, lesson.sourceId, lesson.sequence, lesson.title, lesson.hook, lesson.content, lesson.keyTakeaway, lesson.estimatedMinutes, lesson.difficulty, lesson.audioPath || null, now]
       );
       results.push({ id, ...lesson, createdAt: new Date(now) });
     }
-  });
+    saveSqliteDb();
+  }
 
   return results;
 }
 
 export async function getMicroLessons(sourceId: string): Promise<MicroLesson[]> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
 
-  const rows = await sql`
-    SELECT ml.*,
-           CASE WHEN p.id IS NOT NULL THEN true ELSE false END as is_completed
-    FROM micro_lessons ml
-    LEFT JOIN progress p ON p.lesson_id = ml.id
-    WHERE ml.source_id = ${sourceId}
-    ORDER BY ml.sequence ASC
-  `;
-
-  return rows.map((row) => rowToMicroLesson(row as Record<string, unknown>));
+  if (usePostgres) {
+    const rows = await sql!`
+      SELECT ml.*,
+             CASE WHEN p.id IS NOT NULL THEN true ELSE false END as is_completed
+      FROM micro_lessons ml
+      LEFT JOIN progress p ON p.lesson_id = ml.id
+      WHERE ml.source_id = ${sourceId}
+      ORDER BY ml.sequence ASC
+    `;
+    return rows.map((row) => rowToMicroLesson(row as Record<string, unknown>));
+  } else {
+    const rows = sqliteGetAll(
+      `SELECT ml.*, CASE WHEN p.id IS NOT NULL THEN 1 ELSE 0 END as is_completed
+       FROM micro_lessons ml
+       LEFT JOIN progress p ON p.lesson_id = ml.id
+       WHERE ml.source_id = ?
+       ORDER BY ml.sequence ASC`,
+      [sourceId]
+    );
+    return rows.map(rowToMicroLesson);
+  }
 }
 
 export async function getMicroLesson(id: string): Promise<MicroLesson | null> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
 
-  const rows = await sql`
-    SELECT ml.*,
-           CASE WHEN p.id IS NOT NULL THEN true ELSE false END as is_completed
-    FROM micro_lessons ml
-    LEFT JOIN progress p ON p.lesson_id = ml.id
-    WHERE ml.id = ${id}
-  `;
-
-  if (rows.length === 0) return null;
-  return rowToMicroLesson(rows[0] as Record<string, unknown>);
+  if (usePostgres) {
+    const rows = await sql!`
+      SELECT ml.*,
+             CASE WHEN p.id IS NOT NULL THEN true ELSE false END as is_completed
+      FROM micro_lessons ml
+      LEFT JOIN progress p ON p.lesson_id = ml.id
+      WHERE ml.id = ${id}
+    `;
+    if (rows.length === 0) return null;
+    return rowToMicroLesson(rows[0] as Record<string, unknown>);
+  } else {
+    const rows = sqliteGetAll(
+      `SELECT ml.*, CASE WHEN p.id IS NOT NULL THEN 1 ELSE 0 END as is_completed
+       FROM micro_lessons ml
+       LEFT JOIN progress p ON p.lesson_id = ml.id
+       WHERE ml.id = ?`,
+      [id]
+    );
+    if (rows.length === 0) return null;
+    return rowToMicroLesson(rows[0]);
+  }
 }
 
 // ============================================================================
 // Flashcard operations
 // ============================================================================
 
-export async function createFlashcard(
-  data: Omit<Flashcard, 'id' | 'createdAt'>
-): Promise<Flashcard> {
-  if (!sql) throw new Error('Database not initialized');
+export async function createFlashcard(data: Omit<Flashcard, 'id' | 'createdAt'>): Promise<Flashcard> {
   await initializeDb();
-
   const id = nanoid();
   const now = new Date().toISOString();
 
-  await sql`
-    INSERT INTO flashcards (id, lesson_id, front, back, hint, mnemonic, visual_cue, ease_factor, interval, repetitions, next_review, created_at)
-    VALUES (${id}, ${data.lessonId}, ${data.front}, ${data.back}, ${data.hint || null}, ${data.mnemonic || null}, ${data.visualCue || null}, ${data.easeFactor}, ${data.interval}, ${data.repetitions}, ${data.nextReview?.toISOString() || now}, ${now})
-  `;
+  if (usePostgres) {
+    await sql!`
+      INSERT INTO flashcards (id, lesson_id, front, back, hint, mnemonic, visual_cue, ease_factor, interval, repetitions, next_review, created_at)
+      VALUES (${id}, ${data.lessonId}, ${data.front}, ${data.back}, ${data.hint || null}, ${data.mnemonic || null}, ${data.visualCue || null}, ${data.easeFactor}, ${data.interval}, ${data.repetitions}, ${data.nextReview?.toISOString() || now}, ${now})
+    `;
+  } else {
+    sqliteRun(
+      `INSERT INTO flashcards (id, lesson_id, front, back, hint, mnemonic, visual_cue, ease_factor, interval, repetitions, next_review, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, data.lessonId, data.front, data.back, data.hint || null, data.mnemonic || null, data.visualCue || null, data.easeFactor, data.interval, data.repetitions, data.nextReview?.toISOString() || now, now]
+    );
+  }
 
-  return {
-    id,
-    ...data,
-    createdAt: new Date(now),
-  };
+  return { id, ...data, createdAt: new Date(now) };
 }
 
-/**
- * Batch create flashcards - uses transaction for 70-80% faster inserts
- */
-export async function createFlashcards(
-  cards: Omit<Flashcard, 'id' | 'createdAt'>[]
-): Promise<Flashcard[]> {
-  if (!sql) throw new Error('Database not initialized');
+export async function createFlashcards(cards: Omit<Flashcard, 'id' | 'createdAt'>[]): Promise<Flashcard[]> {
   await initializeDb();
-
   if (cards.length === 0) return [];
 
   const now = new Date().toISOString();
   const results: Flashcard[] = [];
 
-  // Use transaction for batch insert
-  await sql.begin(async (tx: postgres.TransactionSql) => {
+  if (usePostgres) {
+    await sql!.begin(async (tx: postgres.TransactionSql) => {
+      for (const card of cards) {
+        const id = nanoid();
+        await tx.unsafe(
+          `INSERT INTO flashcards (id, lesson_id, front, back, hint, mnemonic, visual_cue, ease_factor, interval, repetitions, next_review, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+          [id, card.lessonId, card.front, card.back, card.hint || null, card.mnemonic || null, card.visualCue || null, card.easeFactor, card.interval, card.repetitions, card.nextReview?.toISOString() || now, now]
+        );
+        results.push({ id, ...card, createdAt: new Date(now) });
+      }
+    });
+  } else {
     for (const card of cards) {
       const id = nanoid();
-      await tx.unsafe(
+      sqliteDb!.run(
         `INSERT INTO flashcards (id, lesson_id, front, back, hint, mnemonic, visual_cue, ease_factor, interval, repetitions, next_review, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [id, card.lessonId, card.front, card.back, card.hint || null, card.mnemonic || null, card.visualCue || null, card.easeFactor, card.interval, card.repetitions, card.nextReview?.toISOString() || now, now]
       );
       results.push({ id, ...card, createdAt: new Date(now) });
     }
-  });
+    saveSqliteDb();
+  }
 
   return results;
 }
 
 export async function getFlashcardsByLesson(lessonId: string): Promise<Flashcard[]> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
 
-  const rows = await sql`
-    SELECT * FROM flashcards WHERE lesson_id = ${lessonId} ORDER BY created_at ASC
-  `;
-
-  return rows.map((row) => rowToFlashcard(row as Record<string, unknown>));
+  if (usePostgres) {
+    const rows = await sql!`SELECT * FROM flashcards WHERE lesson_id = ${lessonId} ORDER BY created_at ASC`;
+    return rows.map((row) => rowToFlashcard(row as Record<string, unknown>));
+  } else {
+    const rows = sqliteGetAll(`SELECT * FROM flashcards WHERE lesson_id = ? ORDER BY created_at ASC`, [lessonId]);
+    return rows.map(rowToFlashcard);
+  }
 }
 
 export async function getFlashcardsBySource(sourceId: string): Promise<Flashcard[]> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
 
-  const rows = await sql`
-    SELECT f.* FROM flashcards f
-    JOIN micro_lessons ml ON f.lesson_id = ml.id
-    WHERE ml.source_id = ${sourceId}
-    ORDER BY f.created_at ASC
-  `;
-
-  return rows.map((row) => rowToFlashcard(row as Record<string, unknown>));
+  if (usePostgres) {
+    const rows = await sql!`
+      SELECT f.* FROM flashcards f
+      JOIN micro_lessons ml ON f.lesson_id = ml.id
+      WHERE ml.source_id = ${sourceId}
+      ORDER BY f.created_at ASC
+    `;
+    return rows.map((row) => rowToFlashcard(row as Record<string, unknown>));
+  } else {
+    const rows = sqliteGetAll(
+      `SELECT f.* FROM flashcards f
+       JOIN micro_lessons ml ON f.lesson_id = ml.id
+       WHERE ml.source_id = ?
+       ORDER BY f.created_at ASC`,
+      [sourceId]
+    );
+    return rows.map(rowToFlashcard);
+  }
 }
 
 export async function getDueFlashcards(limit: number = 20): Promise<Flashcard[]> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
-
   const now = new Date().toISOString();
-  const rows = await sql`
-    SELECT * FROM flashcards
-    WHERE next_review <= ${now}
-    ORDER BY next_review ASC
-    LIMIT ${limit}
-  `;
 
-  return rows.map((row) => rowToFlashcard(row as Record<string, unknown>));
+  if (usePostgres) {
+    const rows = await sql!`
+      SELECT * FROM flashcards
+      WHERE next_review <= ${now}
+      ORDER BY next_review ASC
+      LIMIT ${limit}
+    `;
+    return rows.map((row) => rowToFlashcard(row as Record<string, unknown>));
+  } else {
+    const rows = sqliteGetAll(
+      `SELECT * FROM flashcards WHERE next_review <= ? ORDER BY next_review ASC LIMIT ?`,
+      [now, limit]
+    );
+    return rows.map(rowToFlashcard);
+  }
 }
 
 export async function getFlashcard(id: string): Promise<Flashcard | null> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
 
-  const rows = await sql`SELECT * FROM flashcards WHERE id = ${id}`;
-
-  if (rows.length === 0) return null;
-  return rowToFlashcard(rows[0] as Record<string, unknown>);
+  if (usePostgres) {
+    const rows = await sql!`SELECT * FROM flashcards WHERE id = ${id}`;
+    if (rows.length === 0) return null;
+    return rowToFlashcard(rows[0] as Record<string, unknown>);
+  } else {
+    const rows = sqliteGetAll(`SELECT * FROM flashcards WHERE id = ?`, [id]);
+    if (rows.length === 0) return null;
+    return rowToFlashcard(rows[0]);
+  }
 }
 
 export async function updateFlashcardAfterReview(
@@ -391,17 +549,23 @@ export async function updateFlashcardAfterReview(
   repetitions: number,
   nextReview: Date
 ): Promise<void> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
 
-  await sql`
-    UPDATE flashcards
-    SET ease_factor = ${easeFactor},
-        interval = ${interval},
-        repetitions = ${repetitions},
-        next_review = ${nextReview.toISOString()}
-    WHERE id = ${id}
-  `;
+  if (usePostgres) {
+    await sql!`
+      UPDATE flashcards
+      SET ease_factor = ${easeFactor},
+          interval = ${interval},
+          repetitions = ${repetitions},
+          next_review = ${nextReview.toISOString()}
+      WHERE id = ${id}
+    `;
+  } else {
+    sqliteRun(
+      `UPDATE flashcards SET ease_factor = ?, interval = ?, repetitions = ?, next_review = ? WHERE id = ?`,
+      [easeFactor, interval, repetitions, nextReview.toISOString(), id]
+    );
+  }
 }
 
 // ============================================================================
@@ -413,43 +577,44 @@ export async function markLessonComplete(
   timeSpentSeconds: number,
   comprehensionRating: 1 | 2 | 3 | 4 | 5
 ): Promise<Progress> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
-
   const id = nanoid();
   const now = new Date().toISOString();
 
-  await sql`
-    INSERT INTO progress (id, lesson_id, completed_at, time_spent_seconds, comprehension_rating)
-    VALUES (${id}, ${lessonId}, ${now}, ${timeSpentSeconds}, ${comprehensionRating})
-  `;
+  if (usePostgres) {
+    await sql!`
+      INSERT INTO progress (id, lesson_id, completed_at, time_spent_seconds, comprehension_rating)
+      VALUES (${id}, ${lessonId}, ${now}, ${timeSpentSeconds}, ${comprehensionRating})
+    `;
+  } else {
+    sqliteRun(
+      `INSERT INTO progress (id, lesson_id, completed_at, time_spent_seconds, comprehension_rating) VALUES (?, ?, ?, ?, ?)`,
+      [id, lessonId, now, timeSpentSeconds, comprehensionRating]
+    );
+  }
 
-  return {
-    id,
-    lessonId,
-    completedAt: new Date(now),
-    timeSpentSeconds,
-    comprehensionRating,
-  };
+  return { id, lessonId, completedAt: new Date(now), timeSpentSeconds, comprehensionRating };
 }
 
-export async function recordFlashcardReview(
-  flashcardId: string,
-  rating: number,
-  timeToAnswerMs: number
-): Promise<void> {
-  if (!sql) throw new Error('Database not initialized');
+export async function recordFlashcardReview(flashcardId: string, rating: number, timeToAnswerMs: number): Promise<void> {
   await initializeDb();
-
   const id = nanoid();
-  await sql`
-    INSERT INTO flashcard_reviews (id, flashcard_id, rating, time_to_answer_ms)
-    VALUES (${id}, ${flashcardId}, ${rating}, ${timeToAnswerMs})
-  `;
+
+  if (usePostgres) {
+    await sql!`
+      INSERT INTO flashcard_reviews (id, flashcard_id, rating, time_to_answer_ms)
+      VALUES (${id}, ${flashcardId}, ${rating}, ${timeToAnswerMs})
+    `;
+  } else {
+    sqliteRun(
+      `INSERT INTO flashcard_reviews (id, flashcard_id, rating, time_to_answer_ms) VALUES (?, ?, ?, ?)`,
+      [id, flashcardId, rating, timeToAnswerMs]
+    );
+  }
 }
 
 // ============================================================================
-// Stats - Optimized with range comparisons instead of date() function
+// Stats
 // ============================================================================
 
 export async function getStats(): Promise<{
@@ -461,10 +626,8 @@ export async function getStats(): Promise<{
   currentStreak: number;
   longestStreak: number;
 }> {
-  if (!sql) throw new Error('Database not initialized');
   await initializeDb();
 
-  // Calculate today's date range for efficient indexed queries
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const todayStart = today.toISOString();
@@ -472,30 +635,50 @@ export async function getStats(): Promise<{
   tomorrow.setDate(tomorrow.getDate() + 1);
   const todayEnd = tomorrow.toISOString();
 
-  const rows = await sql`
-    SELECT
-      (SELECT COUNT(*) FROM sources) as total_sources,
-      (SELECT COUNT(*) FROM micro_lessons) as total_lessons,
-      (SELECT COUNT(DISTINCT lesson_id) FROM progress) as completed_lessons,
-      (SELECT COUNT(*) FROM flashcards) as total_cards,
-      (SELECT COUNT(*) FROM flashcard_reviews WHERE reviewed_at >= ${todayStart} AND reviewed_at < ${todayEnd}) as cards_reviewed_today
-  `;
-
-  const stats = rows[0] || {};
-
-  return {
-    totalSources: Number(stats.total_sources) || 0,
-    totalLessons: Number(stats.total_lessons) || 0,
-    completedLessons: Number(stats.completed_lessons) || 0,
-    totalCards: Number(stats.total_cards) || 0,
-    cardsReviewedToday: Number(stats.cards_reviewed_today) || 0,
-    currentStreak: 0, // TODO: Implement streak calculation
-    longestStreak: 0, // TODO: Implement streak calculation
-  };
+  if (usePostgres) {
+    const rows = await sql!`
+      SELECT
+        (SELECT COUNT(*) FROM sources) as total_sources,
+        (SELECT COUNT(*) FROM micro_lessons) as total_lessons,
+        (SELECT COUNT(DISTINCT lesson_id) FROM progress) as completed_lessons,
+        (SELECT COUNT(*) FROM flashcards) as total_cards,
+        (SELECT COUNT(*) FROM flashcard_reviews WHERE reviewed_at >= ${todayStart} AND reviewed_at < ${todayEnd}) as cards_reviewed_today
+    `;
+    const stats = rows[0] || {};
+    return {
+      totalSources: Number(stats.total_sources) || 0,
+      totalLessons: Number(stats.total_lessons) || 0,
+      completedLessons: Number(stats.completed_lessons) || 0,
+      totalCards: Number(stats.total_cards) || 0,
+      cardsReviewedToday: Number(stats.cards_reviewed_today) || 0,
+      currentStreak: 0,
+      longestStreak: 0,
+    };
+  } else {
+    const todayDate = today.toISOString().split('T')[0];
+    const rows = sqliteGetAll(`
+      SELECT
+        (SELECT COUNT(*) FROM sources) as total_sources,
+        (SELECT COUNT(*) FROM micro_lessons) as total_lessons,
+        (SELECT COUNT(DISTINCT lesson_id) FROM progress) as completed_lessons,
+        (SELECT COUNT(*) FROM flashcards) as total_cards,
+        (SELECT COUNT(*) FROM flashcard_reviews WHERE date(reviewed_at) = ?) as cards_reviewed_today
+    `, [todayDate]);
+    const stats = rows[0] || {};
+    return {
+      totalSources: Number(stats.total_sources) || 0,
+      totalLessons: Number(stats.total_lessons) || 0,
+      completedLessons: Number(stats.completed_lessons) || 0,
+      totalCards: Number(stats.total_cards) || 0,
+      cardsReviewedToday: Number(stats.cards_reviewed_today) || 0,
+      currentStreak: 0,
+      longestStreak: 0,
+    };
+  }
 }
 
 // ============================================================================
-// Helper functions to convert database rows to typed objects
+// Row converters
 // ============================================================================
 
 function rowToSource(row: Record<string, unknown>): Source {
