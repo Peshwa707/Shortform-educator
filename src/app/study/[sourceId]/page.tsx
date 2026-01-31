@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import { Source, MicroLesson, Flashcard } from '@/types';
 import ReactMarkdown from 'react-markdown';
+import rehypeSanitize from 'rehype-sanitize';
 
 interface StudyPageProps {
   params: Promise<{ sourceId: string }>;
@@ -297,7 +298,7 @@ export default function StudyPage({ params }: StudyPageProps) {
 
                 {/* Content */}
                 <div className="prose prose-sm max-w-none dark:prose-invert">
-                  <ReactMarkdown>{currentLesson.content}</ReactMarkdown>
+                  <ReactMarkdown rehypePlugins={[rehypeSanitize]}>{currentLesson.content}</ReactMarkdown>
                 </div>
 
                 <Separator />

@@ -2,6 +2,24 @@
 // Uses SQLite when DATABASE_URL is not set, PostgreSQL when it is
 
 import { Source, MicroLesson, Flashcard, Progress, SourceType } from '@/types';
+import {
+  Summary,
+  SummaryType,
+  DocumentSegment,
+  SummaryCollection,
+  CollectionType,
+  CollectionSource,
+  SummaryConcept,
+  SummaryExport,
+  ExportFormat,
+  CreateSummaryInput,
+  CreateDocumentSegmentInput,
+  CreateCollectionInput,
+  CreateCollectionSourceInput,
+  CreateConceptInput,
+  CreateExportInput,
+  UpdateSummaryInput,
+} from '@/types/summaries';
 import { nanoid } from 'nanoid';
 import fs from 'fs';
 import path from 'path';
@@ -678,8 +696,755 @@ export async function getStats(): Promise<{
 }
 
 // ============================================================================
+// Summary operations
+// ============================================================================
+
+export async function createSummary(data: CreateSummaryInput): Promise<Summary> {
+  await initializeDb();
+  const id = nanoid();
+  const now = new Date().toISOString();
+
+  // Calculate next version number
+  let nextVersion = 1;
+  if (usePostgres) {
+    const versionResult = await sql!`
+      SELECT COALESCE(MAX(version), 0) + 1 as next_version
+      FROM summaries
+      WHERE source_id = ${data.sourceId} AND summary_type = ${data.summaryType}
+    `;
+    nextVersion = versionResult[0]?.next_version || 1;
+
+    // Mark previous versions as not current (fix race condition)
+    await sql!`
+      UPDATE summaries
+      SET is_current = false, updated_at = ${now}
+      WHERE source_id = ${data.sourceId}
+        AND summary_type = ${data.summaryType}
+        AND is_current = true
+    `;
+
+    await sql!`
+      INSERT INTO summaries (
+        id, source_id, summary_type, title, content, word_count,
+        version, is_current, parent_version_id,
+        generation_model, generation_duration_ms, input_token_count, output_token_count,
+        quality_score, user_rating, created_at, updated_at
+      ) VALUES (
+        ${id}, ${data.sourceId}, ${data.summaryType}, ${data.title}, ${data.content}, ${data.wordCount},
+        ${nextVersion}, true, ${data.parentVersionId || null},
+        ${data.generationModel}, ${data.generationDurationMs || null}, ${data.inputTokenCount || null}, ${data.outputTokenCount || null},
+        ${data.qualityScore || null}, ${data.userRating || null}, ${now}, ${now}
+      )
+    `;
+  } else {
+    const versionRow = sqliteGetAll(
+      `SELECT COALESCE(MAX(version), 0) + 1 as next_version
+       FROM summaries
+       WHERE source_id = ? AND summary_type = ?`,
+      [data.sourceId, data.summaryType]
+    );
+    nextVersion = (versionRow[0] as Record<string, unknown>)?.next_version as number || 1;
+
+    // Mark previous versions as not current (fix race condition)
+    sqliteRun(
+      `UPDATE summaries
+       SET is_current = 0, updated_at = ?
+       WHERE source_id = ? AND summary_type = ? AND is_current = 1`,
+      [now, data.sourceId, data.summaryType]
+    );
+
+    sqliteRun(
+      `INSERT INTO summaries (
+        id, source_id, summary_type, title, content, word_count,
+        version, is_current, parent_version_id,
+        generation_model, generation_duration_ms, input_token_count, output_token_count,
+        quality_score, user_rating, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id, data.sourceId, data.summaryType, data.title, data.content, data.wordCount,
+        nextVersion, data.parentVersionId || null,
+        data.generationModel, data.generationDurationMs || null, data.inputTokenCount || null, data.outputTokenCount || null,
+        data.qualityScore || null, data.userRating || null, now, now
+      ]
+    );
+  }
+
+  return {
+    id,
+    sourceId: data.sourceId,
+    summaryType: data.summaryType,
+    title: data.title,
+    content: data.content,
+    wordCount: data.wordCount,
+    version: nextVersion,
+    isCurrent: true,
+    parentVersionId: data.parentVersionId,
+    generationModel: data.generationModel,
+    generationDurationMs: data.generationDurationMs,
+    inputTokenCount: data.inputTokenCount,
+    outputTokenCount: data.outputTokenCount,
+    qualityScore: data.qualityScore,
+    userRating: data.userRating,
+    createdAt: new Date(now),
+    updatedAt: new Date(now),
+  };
+}
+
+export async function createSummaries(summaries: CreateSummaryInput[]): Promise<Summary[]> {
+  await initializeDb();
+  if (summaries.length === 0) return [];
+
+  const now = new Date().toISOString();
+  const results: Summary[] = [];
+
+  // Collect unique sourceId/summaryType pairs to calculate versions
+  const versionMap = new Map<string, number>();
+
+  if (usePostgres) {
+    await sql!.begin(async (tx: postgres.TransactionSql) => {
+      for (const data of summaries) {
+        const versionKey = `${data.sourceId}:${data.summaryType}`;
+        let nextVersion: number;
+
+        // Check if we already calculated version for this pair in this batch
+        if (versionMap.has(versionKey)) {
+          nextVersion = versionMap.get(versionKey)!;
+        } else {
+          // Calculate next version number
+          const versionResult = await tx.unsafe(
+            `SELECT COALESCE(MAX(version), 0) + 1 as next_version
+             FROM summaries
+             WHERE source_id = $1 AND summary_type = $2`,
+            [data.sourceId, data.summaryType]
+          );
+          nextVersion = Number(versionResult[0]?.next_version) || 1;
+
+          // Mark previous versions as not current
+          await tx.unsafe(
+            `UPDATE summaries
+             SET is_current = false, updated_at = $1
+             WHERE source_id = $2 AND summary_type = $3 AND is_current = true`,
+            [now, data.sourceId, data.summaryType]
+          );
+
+          versionMap.set(versionKey, nextVersion);
+        }
+
+        const id = nanoid();
+        await tx.unsafe(
+          `INSERT INTO summaries (
+            id, source_id, summary_type, title, content, word_count,
+            version, is_current, parent_version_id,
+            generation_model, generation_duration_ms, input_token_count, output_token_count,
+            quality_score, user_rating, created_at, updated_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+          [
+            id, data.sourceId, data.summaryType, data.title, data.content, data.wordCount,
+            nextVersion,
+            data.parentVersionId || null,
+            data.generationModel, data.generationDurationMs || null, data.inputTokenCount || null, data.outputTokenCount || null,
+            data.qualityScore || null, data.userRating || null, now, now
+          ]
+        );
+        results.push({
+          id,
+          sourceId: data.sourceId,
+          summaryType: data.summaryType,
+          title: data.title,
+          content: data.content,
+          wordCount: data.wordCount,
+          version: nextVersion,
+          isCurrent: true,
+          parentVersionId: data.parentVersionId,
+          generationModel: data.generationModel,
+          generationDurationMs: data.generationDurationMs,
+          inputTokenCount: data.inputTokenCount,
+          outputTokenCount: data.outputTokenCount,
+          qualityScore: data.qualityScore,
+          userRating: data.userRating,
+          createdAt: new Date(now),
+          updatedAt: new Date(now),
+        });
+      }
+    });
+  } else {
+    for (const data of summaries) {
+      const versionKey = `${data.sourceId}:${data.summaryType}`;
+      let nextVersion: number;
+
+      // Check if we already calculated version for this pair in this batch
+      if (versionMap.has(versionKey)) {
+        nextVersion = versionMap.get(versionKey)!;
+      } else {
+        // Calculate next version number
+        const versionRows = sqliteGetAll(
+          `SELECT COALESCE(MAX(version), 0) + 1 as next_version
+           FROM summaries
+           WHERE source_id = ? AND summary_type = ?`,
+          [data.sourceId, data.summaryType]
+        );
+        nextVersion = Number(versionRows[0]?.next_version) || 1;
+
+        // Mark previous versions as not current
+        sqliteDb!.run(
+          `UPDATE summaries
+           SET is_current = 0, updated_at = ?
+           WHERE source_id = ? AND summary_type = ? AND is_current = 1`,
+          [now, data.sourceId, data.summaryType]
+        );
+
+        versionMap.set(versionKey, nextVersion);
+      }
+
+      const id = nanoid();
+      sqliteDb!.run(
+        `INSERT INTO summaries (
+          id, source_id, summary_type, title, content, word_count,
+          version, is_current, parent_version_id,
+          generation_model, generation_duration_ms, input_token_count, output_token_count,
+          quality_score, user_rating, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id, data.sourceId, data.summaryType, data.title, data.content, data.wordCount,
+          nextVersion,
+          data.parentVersionId || null,
+          data.generationModel, data.generationDurationMs || null, data.inputTokenCount || null, data.outputTokenCount || null,
+          data.qualityScore || null, data.userRating || null, now, now
+        ]
+      );
+      results.push({
+        id,
+        sourceId: data.sourceId,
+        summaryType: data.summaryType,
+        title: data.title,
+        content: data.content,
+        wordCount: data.wordCount,
+        version: nextVersion,
+        isCurrent: true,
+        parentVersionId: data.parentVersionId,
+        generationModel: data.generationModel,
+        generationDurationMs: data.generationDurationMs,
+        inputTokenCount: data.inputTokenCount,
+        outputTokenCount: data.outputTokenCount,
+        qualityScore: data.qualityScore,
+        userRating: data.userRating,
+        createdAt: new Date(now),
+        updatedAt: new Date(now),
+      });
+    }
+    saveSqliteDb();
+  }
+
+  return results;
+}
+
+export async function getSummary(id: string): Promise<Summary | null> {
+  await initializeDb();
+
+  if (usePostgres) {
+    const rows = await sql!`SELECT * FROM summaries WHERE id = ${id}`;
+    if (rows.length === 0) return null;
+    return rowToSummary(rows[0] as Record<string, unknown>);
+  } else {
+    const rows = sqliteGetAll(`SELECT * FROM summaries WHERE id = ?`, [id]);
+    if (rows.length === 0) return null;
+    return rowToSummary(rows[0]);
+  }
+}
+
+export async function getSummariesBySource(
+  sourceId: string,
+  summaryType?: SummaryType,
+  currentOnly: boolean = true
+): Promise<Summary[]> {
+  await initializeDb();
+
+  if (usePostgres) {
+    if (summaryType) {
+      const rows = await sql!`
+        SELECT * FROM summaries
+        WHERE source_id = ${sourceId}
+          AND summary_type = ${summaryType}
+          ${currentOnly ? sql!`AND is_current = true` : sql!``}
+        ORDER BY created_at DESC
+      `;
+      return rows.map((row) => rowToSummary(row as Record<string, unknown>));
+    } else {
+      const rows = await sql!`
+        SELECT * FROM summaries
+        WHERE source_id = ${sourceId}
+          ${currentOnly ? sql!`AND is_current = true` : sql!``}
+        ORDER BY
+          CASE summary_type
+            WHEN 'executive' THEN 1
+            WHEN 'key_points' THEN 2
+            WHEN 'detailed' THEN 3
+            WHEN 'segment' THEN 4
+          END,
+          created_at DESC
+      `;
+      return rows.map((row) => rowToSummary(row as Record<string, unknown>));
+    }
+  } else {
+    let query = `SELECT * FROM summaries WHERE source_id = ?`;
+    const params: unknown[] = [sourceId];
+
+    if (summaryType) {
+      query += ` AND summary_type = ?`;
+      params.push(summaryType);
+    }
+    if (currentOnly) {
+      query += ` AND is_current = 1`;
+    }
+    query += ` ORDER BY
+      CASE summary_type
+        WHEN 'executive' THEN 1
+        WHEN 'key_points' THEN 2
+        WHEN 'detailed' THEN 3
+        WHEN 'segment' THEN 4
+      END,
+      created_at DESC`;
+
+    const rows = sqliteGetAll(query, params);
+    return rows.map(rowToSummary);
+  }
+}
+
+export async function updateSummary(id: string, updates: UpdateSummaryInput): Promise<void> {
+  await initializeDb();
+  const now = new Date().toISOString();
+
+  if (usePostgres) {
+    await sql!`
+      UPDATE summaries
+      SET title = COALESCE(${updates.title || null}, title),
+          content = COALESCE(${updates.content || null}, content),
+          quality_score = COALESCE(${updates.qualityScore || null}, quality_score),
+          user_rating = COALESCE(${updates.userRating || null}, user_rating),
+          updated_at = ${now}
+      WHERE id = ${id}
+    `;
+  } else {
+    const setClauses: string[] = ['updated_at = ?'];
+    const params: unknown[] = [now];
+
+    if (updates.title !== undefined) {
+      setClauses.push('title = ?');
+      params.push(updates.title);
+    }
+    if (updates.content !== undefined) {
+      setClauses.push('content = ?');
+      params.push(updates.content);
+    }
+    if (updates.qualityScore !== undefined) {
+      setClauses.push('quality_score = ?');
+      params.push(updates.qualityScore);
+    }
+    if (updates.userRating !== undefined) {
+      setClauses.push('user_rating = ?');
+      params.push(updates.userRating);
+    }
+
+    params.push(id);
+    sqliteRun(`UPDATE summaries SET ${setClauses.join(', ')} WHERE id = ?`, params);
+  }
+}
+
+export async function deleteSummary(id: string): Promise<void> {
+  await initializeDb();
+  if (usePostgres) {
+    await sql!`DELETE FROM summaries WHERE id = ${id}`;
+  } else {
+    sqliteRun(`DELETE FROM summaries WHERE id = ?`, [id]);
+  }
+}
+
+export async function getSummaryVersions(sourceId: string, summaryType: SummaryType): Promise<Summary[]> {
+  await initializeDb();
+
+  if (usePostgres) {
+    const rows = await sql!`
+      SELECT * FROM summaries
+      WHERE source_id = ${sourceId} AND summary_type = ${summaryType}
+      ORDER BY version DESC
+    `;
+    return rows.map((row) => rowToSummary(row as Record<string, unknown>));
+  } else {
+    const rows = sqliteGetAll(
+      `SELECT * FROM summaries WHERE source_id = ? AND summary_type = ? ORDER BY version DESC`,
+      [sourceId, summaryType]
+    );
+    return rows.map(rowToSummary);
+  }
+}
+
+// ============================================================================
+// Document Segment operations
+// ============================================================================
+
+export async function createDocumentSegments(
+  segments: CreateDocumentSegmentInput[]
+): Promise<DocumentSegment[]> {
+  await initializeDb();
+  if (segments.length === 0) return [];
+
+  const now = new Date().toISOString();
+  const results: DocumentSegment[] = [];
+
+  if (usePostgres) {
+    await sql!.begin(async (tx: postgres.TransactionSql) => {
+      for (const seg of segments) {
+        const id = nanoid();
+        await tx.unsafe(
+          `INSERT INTO document_segments (
+            id, source_id, segment_index, start_index, end_index,
+            section_title, level, estimated_tokens, created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [
+            id, seg.sourceId, seg.segmentIndex, seg.startIndex || null, seg.endIndex || null,
+            seg.sectionTitle || null, seg.level, seg.estimatedTokens || null, now
+          ]
+        );
+        results.push({ id, ...seg, createdAt: new Date(now) });
+      }
+    });
+  } else {
+    for (const seg of segments) {
+      const id = nanoid();
+      sqliteDb!.run(
+        `INSERT INTO document_segments (
+          id, source_id, segment_index, start_index, end_index,
+          section_title, level, estimated_tokens, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id, seg.sourceId, seg.segmentIndex, seg.startIndex || null, seg.endIndex || null,
+          seg.sectionTitle || null, seg.level, seg.estimatedTokens || null, now
+        ]
+      );
+      results.push({ id, ...seg, createdAt: new Date(now) });
+    }
+    saveSqliteDb();
+  }
+
+  return results;
+}
+
+export async function getDocumentSegments(sourceId: string): Promise<DocumentSegment[]> {
+  await initializeDb();
+
+  if (usePostgres) {
+    const rows = await sql!`
+      SELECT * FROM document_segments WHERE source_id = ${sourceId} ORDER BY segment_index ASC
+    `;
+    return rows.map((row) => rowToDocumentSegment(row as Record<string, unknown>));
+  } else {
+    const rows = sqliteGetAll(
+      `SELECT * FROM document_segments WHERE source_id = ? ORDER BY segment_index ASC`,
+      [sourceId]
+    );
+    return rows.map(rowToDocumentSegment);
+  }
+}
+
+export async function deleteDocumentSegments(sourceId: string): Promise<void> {
+  await initializeDb();
+
+  if (usePostgres) {
+    await sql!`DELETE FROM document_segments WHERE source_id = ${sourceId}`;
+  } else {
+    sqliteRun(`DELETE FROM document_segments WHERE source_id = ?`, [sourceId]);
+  }
+}
+
+// ============================================================================
+// Collection operations
+// ============================================================================
+
+export async function createCollection(data: CreateCollectionInput): Promise<SummaryCollection> {
+  await initializeDb();
+  const id = nanoid();
+  const now = new Date().toISOString();
+
+  if (usePostgres) {
+    await sql!`
+      INSERT INTO summary_collections (id, name, description, collection_type, created_at)
+      VALUES (${id}, ${data.name}, ${data.description || null}, ${data.collectionType}, ${now})
+    `;
+  } else {
+    sqliteRun(
+      `INSERT INTO summary_collections (id, name, description, collection_type, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [id, data.name, data.description || null, data.collectionType, now]
+    );
+  }
+
+  return {
+    id,
+    name: data.name,
+    description: data.description,
+    collectionType: data.collectionType,
+    createdAt: new Date(now),
+  };
+}
+
+export async function getCollections(): Promise<SummaryCollection[]> {
+  await initializeDb();
+
+  if (usePostgres) {
+    const rows = await sql!`
+      SELECT sc.*, COUNT(cs.id) as source_count
+      FROM summary_collections sc
+      LEFT JOIN collection_sources cs ON cs.collection_id = sc.id
+      GROUP BY sc.id
+      ORDER BY sc.created_at DESC
+    `;
+    return rows.map((row) => rowToCollection(row as Record<string, unknown>));
+  } else {
+    const rows = sqliteGetAll(`
+      SELECT sc.*, COUNT(cs.id) as source_count
+      FROM summary_collections sc
+      LEFT JOIN collection_sources cs ON cs.collection_id = sc.id
+      GROUP BY sc.id
+      ORDER BY sc.created_at DESC
+    `);
+    return rows.map(rowToCollection);
+  }
+}
+
+export async function getCollection(id: string): Promise<SummaryCollection | null> {
+  await initializeDb();
+
+  if (usePostgres) {
+    const rows = await sql!`
+      SELECT sc.*, COUNT(cs.id) as source_count
+      FROM summary_collections sc
+      LEFT JOIN collection_sources cs ON cs.collection_id = sc.id
+      WHERE sc.id = ${id}
+      GROUP BY sc.id
+    `;
+    if (rows.length === 0) return null;
+    return rowToCollection(rows[0] as Record<string, unknown>);
+  } else {
+    const rows = sqliteGetAll(`
+      SELECT sc.*, COUNT(cs.id) as source_count
+      FROM summary_collections sc
+      LEFT JOIN collection_sources cs ON cs.collection_id = sc.id
+      WHERE sc.id = ?
+      GROUP BY sc.id
+    `, [id]);
+    if (rows.length === 0) return null;
+    return rowToCollection(rows[0]);
+  }
+}
+
+export async function addSourceToCollection(data: CreateCollectionSourceInput): Promise<CollectionSource> {
+  await initializeDb();
+  const id = nanoid();
+
+  if (usePostgres) {
+    await sql!`
+      INSERT INTO collection_sources (id, collection_id, source_id, sequence, weight)
+      VALUES (${id}, ${data.collectionId}, ${data.sourceId}, ${data.sequence || null}, ${data.weight})
+    `;
+  } else {
+    sqliteRun(
+      `INSERT INTO collection_sources (id, collection_id, source_id, sequence, weight)
+       VALUES (?, ?, ?, ?, ?)`,
+      [id, data.collectionId, data.sourceId, data.sequence || null, data.weight]
+    );
+  }
+
+  return { id, ...data };
+}
+
+export async function getCollectionSources(collectionId: string): Promise<CollectionSource[]> {
+  await initializeDb();
+
+  if (usePostgres) {
+    const rows = await sql!`
+      SELECT * FROM collection_sources WHERE collection_id = ${collectionId} ORDER BY sequence ASC
+    `;
+    return rows.map((row) => rowToCollectionSource(row as Record<string, unknown>));
+  } else {
+    const rows = sqliteGetAll(
+      `SELECT * FROM collection_sources WHERE collection_id = ? ORDER BY sequence ASC`,
+      [collectionId]
+    );
+    return rows.map(rowToCollectionSource);
+  }
+}
+
+// ============================================================================
+// Concept operations
+// ============================================================================
+
+export async function createConcepts(concepts: CreateConceptInput[]): Promise<SummaryConcept[]> {
+  await initializeDb();
+  if (concepts.length === 0) return [];
+
+  const results: SummaryConcept[] = [];
+
+  if (usePostgres) {
+    await sql!.begin(async (tx: postgres.TransactionSql) => {
+      for (const concept of concepts) {
+        const id = nanoid();
+        await tx.unsafe(
+          `INSERT INTO summary_concepts (id, summary_id, concept, concept_normalized, definition, importance_score)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [id, concept.summaryId, concept.concept, concept.conceptNormalized, concept.definition || null, concept.importanceScore]
+        );
+        results.push({ id, ...concept });
+      }
+    });
+  } else {
+    for (const concept of concepts) {
+      const id = nanoid();
+      sqliteDb!.run(
+        `INSERT INTO summary_concepts (id, summary_id, concept, concept_normalized, definition, importance_score)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [id, concept.summaryId, concept.concept, concept.conceptNormalized, concept.definition || null, concept.importanceScore]
+      );
+      results.push({ id, ...concept });
+    }
+    saveSqliteDb();
+  }
+
+  return results;
+}
+
+export async function getConceptsBySummary(summaryId: string): Promise<SummaryConcept[]> {
+  await initializeDb();
+
+  if (usePostgres) {
+    const rows = await sql!`
+      SELECT * FROM summary_concepts WHERE summary_id = ${summaryId} ORDER BY importance_score DESC
+    `;
+    return rows.map((row) => rowToConcept(row as Record<string, unknown>));
+  } else {
+    const rows = sqliteGetAll(
+      `SELECT * FROM summary_concepts WHERE summary_id = ? ORDER BY importance_score DESC`,
+      [summaryId]
+    );
+    return rows.map(rowToConcept);
+  }
+}
+
+// ============================================================================
+// Export operations
+// ============================================================================
+
+export async function createExport(data: CreateExportInput): Promise<SummaryExport> {
+  await initializeDb();
+  const id = nanoid();
+  const now = new Date().toISOString();
+
+  if (usePostgres) {
+    await sql!`
+      INSERT INTO summary_exports (id, summary_id, export_format, file_path, created_at)
+      VALUES (${id}, ${data.summaryId}, ${data.exportFormat}, ${data.filePath || null}, ${now})
+    `;
+  } else {
+    sqliteRun(
+      `INSERT INTO summary_exports (id, summary_id, export_format, file_path, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [id, data.summaryId, data.exportFormat, data.filePath || null, now]
+    );
+  }
+
+  return {
+    id,
+    summaryId: data.summaryId,
+    exportFormat: data.exportFormat,
+    filePath: data.filePath,
+    downloadCount: 0,
+    createdAt: new Date(now),
+  };
+}
+
+export async function incrementExportDownloadCount(id: string): Promise<void> {
+  await initializeDb();
+
+  if (usePostgres) {
+    await sql!`UPDATE summary_exports SET download_count = download_count + 1 WHERE id = ${id}`;
+  } else {
+    sqliteRun(`UPDATE summary_exports SET download_count = download_count + 1 WHERE id = ?`, [id]);
+  }
+}
+
+// ============================================================================
 // Row converters
 // ============================================================================
+
+function rowToSummary(row: Record<string, unknown>): Summary {
+  return {
+    id: row.id as string,
+    sourceId: row.source_id as string,
+    summaryType: row.summary_type as SummaryType,
+    title: row.title as string,
+    content: row.content as string,
+    wordCount: Number(row.word_count) || 0,
+    version: Number(row.version) || 1,
+    // Fix: Handle both SQLite (0/1) and PostgreSQL (true/false) boolean values
+    isCurrent: row.is_current === true || row.is_current === 1 || row.is_current === '1',
+    parentVersionId: row.parent_version_id ? String(row.parent_version_id) : undefined,
+    generationModel: row.generation_model as string,
+    generationDurationMs: row.generation_duration_ms ? Number(row.generation_duration_ms) : undefined,
+    inputTokenCount: row.input_token_count ? Number(row.input_token_count) : undefined,
+    outputTokenCount: row.output_token_count ? Number(row.output_token_count) : undefined,
+    qualityScore: row.quality_score ? Number(row.quality_score) : undefined,
+    userRating: row.user_rating ? Number(row.user_rating) as 1 | 2 | 3 | 4 | 5 : undefined,
+    createdAt: new Date(row.created_at as string),
+    updatedAt: new Date(row.updated_at as string),
+  };
+}
+
+function rowToDocumentSegment(row: Record<string, unknown>): DocumentSegment {
+  return {
+    id: row.id as string,
+    sourceId: row.source_id as string,
+    segmentIndex: Number(row.segment_index),
+    startIndex: row.start_index ? Number(row.start_index) : undefined,
+    endIndex: row.end_index ? Number(row.end_index) : undefined,
+    sectionTitle: row.section_title as string | undefined,
+    level: Number(row.level) || 0,
+    estimatedTokens: row.estimated_tokens ? Number(row.estimated_tokens) : undefined,
+    createdAt: new Date(row.created_at as string),
+  };
+}
+
+function rowToCollection(row: Record<string, unknown>): SummaryCollection {
+  return {
+    id: row.id as string,
+    name: row.name as string,
+    description: row.description as string | undefined,
+    collectionType: row.collection_type as CollectionType,
+    aggregatedSummaryId: row.aggregated_summary_id as string | undefined,
+    createdAt: new Date(row.created_at as string),
+    sourceCount: row.source_count ? Number(row.source_count) : undefined,
+  };
+}
+
+function rowToCollectionSource(row: Record<string, unknown>): CollectionSource {
+  return {
+    id: row.id as string,
+    collectionId: row.collection_id as string,
+    sourceId: row.source_id as string,
+    sequence: row.sequence !== null && row.sequence !== undefined ? Number(row.sequence) : undefined,
+    // Fix: Don't convert weight 0 to 1.0 - properly check for null/undefined
+    weight: row.weight !== null && row.weight !== undefined ? Number(row.weight) : 1.0,
+  };
+}
+
+function rowToConcept(row: Record<string, unknown>): SummaryConcept {
+  return {
+    id: row.id as string,
+    summaryId: row.summary_id as string,
+    concept: row.concept as string,
+    conceptNormalized: row.concept_normalized as string,
+    definition: row.definition as string | undefined,
+    importanceScore: Number(row.importance_score) || 0.5,
+  };
+}
 
 function rowToSource(row: Record<string, unknown>): Source {
   return {
@@ -691,8 +1456,9 @@ function rowToSource(row: Record<string, unknown>): Source {
     rawText: row.raw_text as string | undefined,
     processedAt: row.processed_at ? new Date(row.processed_at as string) : undefined,
     createdAt: new Date(row.created_at as string),
-    lessonCount: Number(row.lesson_count) || undefined,
-    cardCount: Number(row.card_count) || undefined,
+    // Fix: Don't convert 0 to undefined - properly check for null/undefined
+    lessonCount: row.lesson_count !== null && row.lesson_count !== undefined ? Number(row.lesson_count) : undefined,
+    cardCount: row.card_count !== null && row.card_count !== undefined ? Number(row.card_count) : undefined,
   };
 }
 

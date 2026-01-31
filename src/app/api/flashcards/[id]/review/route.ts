@@ -1,7 +1,8 @@
 // API route for reviewing a flashcard
 import { NextRequest, NextResponse } from 'next/server';
 import { initializeDb, updateFlashcardAfterReview, recordFlashcardReview, getFlashcard } from '@/lib/db/client';
-import { calculateSM2, simpleToSM2Rating, SimpleRating } from '@/lib/services/sm2';
+import { calculateSM2, simpleToSM2Rating } from '@/lib/services/sm2';
+import { validateBody, FlashcardReviewSchema } from '@/lib/validations';
 
 // POST /api/flashcards/[id]/review - Submit a review for a flashcard
 export async function POST(
@@ -11,17 +12,17 @@ export async function POST(
   try {
     await initializeDb();
     const { id } = await params;
-    const body = await request.json();
-    const { rating, timeToAnswerMs } = body;
 
-    // Validate rating
-    const validRatings: SimpleRating[] = ['again', 'hard', 'good', 'easy'];
-    if (!rating || !validRatings.includes(rating)) {
+    // Validate request body with Zod
+    const validation = await validateBody(request, FlashcardReviewSchema);
+    if (!validation.success) {
       return NextResponse.json(
-        { error: 'Rating must be one of: again, hard, good, easy' },
+        { error: validation.error },
         { status: 400 }
       );
     }
+
+    const { rating, timeToAnswerMs } = validation.data;
 
     // Get the flashcard
     const flashcard = await getFlashcard(id);

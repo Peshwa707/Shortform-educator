@@ -10,12 +10,35 @@ import {
   getOne,
 } from '@/lib/db/client';
 import { chunkContent } from '@/lib/ai/chunker';
+import {
+  checkRateLimit,
+  getClientIP,
+  createRateLimitHeaders,
+  RateLimitConfigs,
+} from '@/lib/rate-limiter';
 
 // POST /api/process/[sourceId] - Process a source into micro-lessons
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ sourceId: string }> }
 ) {
+  // Rate limit AI processing - expensive operation
+  const clientIP = getClientIP(request);
+  const rateLimitResult = checkRateLimit(
+    `process:${clientIP}`,
+    RateLimitConfigs.AI_PROCESSING
+  );
+
+  if (!rateLimitResult.allowed) {
+    return NextResponse.json(
+      { error: 'Too many processing requests. Please wait before trying again.' },
+      {
+        status: 429,
+        headers: createRateLimitHeaders(rateLimitResult),
+      }
+    );
+  }
+
   try {
     await initializeDb();
     const { sourceId } = await params;

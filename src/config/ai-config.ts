@@ -57,6 +57,15 @@ export const AI_CONFIG = {
     connectRealWorld: true,     // Real-world context connections
     reEngagementPrompts: true,  // Prompts for stuck learners
   },
+
+  // Summarization configuration
+  summarization: {
+    maxSegmentTokens: 15000,       // Input per segment
+    segmentSummaryTokens: 2000,   // Output per segment
+    keyPointsOutputTokens: 1500,
+    executiveOutputTokens: 800,
+    detailedOutputTokens: 3000,
+  },
 } as const;
 
 export type AIConfig = typeof AI_CONFIG;
