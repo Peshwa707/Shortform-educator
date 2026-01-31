@@ -13,6 +13,7 @@ import {
   CheckCircle2,
   PartyPopper,
   ArrowRight,
+  AlertCircle,
 } from 'lucide-react';
 import { Flashcard } from '@/types';
 import { getRatingStyle, predictNextIntervals, SimpleRating } from '@/lib/services/sm2';
@@ -57,22 +58,31 @@ export function FlashcardReview() {
   const isComplete = currentIndex >= cards.length;
   const progress = cards.length > 0 ? (reviewedCount / cards.length) * 100 : 0;
 
+  const [reviewError, setReviewError] = useState<string | null>(null);
+
   const handleRating = async (rating: SimpleRating) => {
     if (!currentCard) return;
 
     const timeToAnswerMs = Date.now() - startTime;
+    setReviewError(null);
 
     try {
-      await fetch(`/api/flashcards/${currentCard.id}/review`, {
+      const res = await fetch(`/api/flashcards/${currentCard.id}/review`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ rating, timeToAnswerMs }),
       });
 
+      if (!res.ok) {
+        throw new Error('Failed to submit review');
+      }
+
+      // Only update state after successful API call
       setReviewedCount((prev) => prev + 1);
       setCurrentIndex((prev) => prev + 1);
     } catch (err) {
       console.error('Failed to submit review:', err);
+      setReviewError('Failed to save review. Please try again.');
     }
   };
 
@@ -253,6 +263,14 @@ export function FlashcardReview() {
           )}
         </CardContent>
       </Card>
+
+      {/* Error display */}
+      {reviewError && (
+        <div className="p-3 bg-destructive/10 border border-destructive/20 rounded-lg flex items-center gap-2 text-destructive">
+          <AlertCircle className="w-4 h-4 flex-shrink-0" />
+          <span className="text-sm">{reviewError}</span>
+        </div>
+      )}
 
       {/* Rating buttons */}
       {showAnswer && (

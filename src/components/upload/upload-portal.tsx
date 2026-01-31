@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -15,6 +15,10 @@ interface UploadPortalProps {
 
 type UploadStatus = 'idle' | 'uploading' | 'processing' | 'complete' | 'error';
 
+// Maximum file size: 50MB
+const MAX_FILE_SIZE_MB = 50;
+const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
+
 export function UploadPortal({ onUploadComplete }: UploadPortalProps) {
   const [status, setStatus] = useState<UploadStatus>('idle');
   const [progress, setProgress] = useState(0);
@@ -28,6 +32,19 @@ export function UploadPortal({ onUploadComplete }: UploadPortalProps) {
   // File input state
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [dragActive, setDragActive] = useState(false);
+
+  // Ref to track polling interval for cleanup
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Cleanup polling interval on unmount
+  useEffect(() => {
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
+    };
+  }, []);
 
   const handleDrag = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -47,6 +64,10 @@ export function UploadPortal({ onUploadComplete }: UploadPortalProps) {
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       const file = e.dataTransfer.files[0];
       if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+        if (file.size > MAX_FILE_SIZE_BYTES) {
+          setError(`File too large. Maximum size is ${MAX_FILE_SIZE_MB}MB`);
+          return;
+        }
         setSelectedFile(file);
         setError(null);
       } else {
@@ -59,6 +80,10 @@ export function UploadPortal({ onUploadComplete }: UploadPortalProps) {
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
       if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+        if (file.size > MAX_FILE_SIZE_BYTES) {
+          setError(`File too large. Maximum size is ${MAX_FILE_SIZE_MB}MB`);
+          return;
+        }
         setSelectedFile(file);
         setError(null);
       } else {
@@ -67,30 +92,40 @@ export function UploadPortal({ onUploadComplete }: UploadPortalProps) {
     }
   };
 
+  const clearPolling = () => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+  };
+
   const processSource = async (id: string) => {
     setStatus('processing');
     setProgress(20);
 
+    // Clear any existing polling
+    clearPolling();
+
     // Poll for processing status
-    const pollInterval = setInterval(async () => {
+    pollIntervalRef.current = setInterval(async () => {
       try {
         const statusRes = await fetch(`/api/process/${id}`);
         const statusData = await statusRes.json();
 
         if (statusData.status === 'complete') {
-          clearInterval(pollInterval);
+          clearPolling();
           setProgress(100);
           setStatus('complete');
           setTimeout(() => onUploadComplete(id), 1500);
         } else if (statusData.status === 'error') {
-          clearInterval(pollInterval);
+          clearPolling();
           setError(statusData.error || 'Processing failed');
           setStatus('error');
         } else {
           setProgress(statusData.progress || 50);
         }
       } catch (err) {
-        clearInterval(pollInterval);
+        clearPolling();
         setError('Failed to check processing status');
         setStatus('error');
       }
@@ -100,12 +135,12 @@ export function UploadPortal({ onUploadComplete }: UploadPortalProps) {
     try {
       const processRes = await fetch(`/api/process/${id}`, { method: 'POST' });
       if (!processRes.ok) {
-        clearInterval(pollInterval);
+        clearPolling();
         const data = await processRes.json();
         throw new Error(data.error || 'Processing failed');
       }
     } catch (err) {
-      clearInterval(pollInterval);
+      clearPolling();
       setError(err instanceof Error ? err.message : 'Processing failed');
       setStatus('error');
     }

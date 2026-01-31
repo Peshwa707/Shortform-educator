@@ -21,6 +21,7 @@ import {
   Layers,
   Brain,
   RefreshCw,
+  Loader2,
 } from 'lucide-react';
 import { Source } from '@/types';
 import { formatDistanceToNow } from 'date-fns';
@@ -33,6 +34,7 @@ export function LibraryBrowser({ onStudy }: LibraryBrowserProps) {
   const [sources, setSources] = useState<Source[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [processingIds, setProcessingIds] = useState<Set<string>>(new Set());
 
   const fetchSources = async () => {
     try {
@@ -68,11 +70,47 @@ export function LibraryBrowser({ onStudy }: LibraryBrowserProps) {
 
   const handleReprocess = async (sourceId: string) => {
     try {
+      // Mark as processing immediately for UI feedback
+      setProcessingIds((prev) => new Set(prev).add(sourceId));
+
       const res = await fetch(`/api/process/${sourceId}`, { method: 'POST' });
       if (!res.ok) throw new Error('Failed to reprocess');
-      // Refresh the list
-      fetchSources();
+
+      // Poll for completion
+      const pollStatus = async () => {
+        try {
+          const statusRes = await fetch(`/api/process/${sourceId}`);
+          const statusData = await statusRes.json();
+
+          if (statusData.status === 'complete' || statusData.status === 'error') {
+            setProcessingIds((prev) => {
+              const next = new Set(prev);
+              next.delete(sourceId);
+              return next;
+            });
+            // Refresh the list to get updated counts
+            fetchSources();
+          } else {
+            // Continue polling
+            setTimeout(pollStatus, 2000);
+          }
+        } catch {
+          setProcessingIds((prev) => {
+            const next = new Set(prev);
+            next.delete(sourceId);
+            return next;
+          });
+        }
+      };
+
+      // Start polling after a short delay
+      setTimeout(pollStatus, 1000);
     } catch (err) {
+      setProcessingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(sourceId);
+        return next;
+      });
       alert('Failed to reprocess content');
     }
   };
@@ -199,9 +237,16 @@ export function LibraryBrowser({ onStudy }: LibraryBrowserProps) {
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
-                    <DropdownMenuItem onClick={() => handleReprocess(source.id)}>
-                      <RefreshCw className="w-4 h-4 mr-2" />
-                      Reprocess
+                    <DropdownMenuItem
+                      onClick={() => handleReprocess(source.id)}
+                      disabled={processingIds.has(source.id)}
+                    >
+                      {processingIds.has(source.id) ? (
+                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      ) : (
+                        <RefreshCw className="w-4 h-4 mr-2" />
+                      )}
+                      {processingIds.has(source.id) ? 'Reprocessing...' : 'Reprocess'}
                     </DropdownMenuItem>
                     <DropdownMenuItem
                       className="text-destructive"

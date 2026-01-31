@@ -3,6 +3,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createSource, getAllSources, initializeDb } from '@/lib/db/client';
 import { extractPdfText, cleanExtractedText, extractTitle } from '@/lib/services/pdf-extractor';
 
+// Maximum file size: 50MB
+const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024;
+
 // GET /api/sources - List all sources
 export async function GET() {
   try {
@@ -41,6 +44,14 @@ export async function POST(request: NextRequest) {
       if (!file.name.toLowerCase().endsWith('.pdf')) {
         return NextResponse.json(
           { error: 'Only PDF files are supported currently' },
+          { status: 400 }
+        );
+      }
+
+      // Check file size
+      if (file.size > MAX_FILE_SIZE_BYTES) {
+        return NextResponse.json(
+          { error: 'File too large. Maximum size is 50MB' },
           { status: 400 }
         );
       }

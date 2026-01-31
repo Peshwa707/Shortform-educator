@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Upload, Library, BookOpen, Brain } from 'lucide-react';
 import { UploadPortal } from '@/components/upload/upload-portal';
@@ -9,6 +10,7 @@ import { FlashcardReview } from '@/components/flashcards/flashcard-review';
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState('library');
+  const router = useRouter();
 
   return (
     <main className="min-h-screen bg-background">
@@ -49,8 +51,8 @@ export default function Home() {
 
           <TabsContent value="library">
             <LibraryBrowser onStudy={(sourceId) => {
-              // Navigate to study mode - will be handled by router later
-              window.location.href = `/study/${sourceId}`;
+              // Navigate to study mode using Next.js router for client-side navigation
+              router.push(`/study/${sourceId}`);
             }} />
           </TabsContent>
 
