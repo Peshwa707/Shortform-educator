@@ -23,6 +23,7 @@ import {
 import { nanoid } from 'nanoid';
 import fs from 'fs';
 import path from 'path';
+import { POSTGRES_SCHEMA } from './schema-embedded';
 
 // Detect which database to use
 const usePostgres = !!process.env.DATABASE_URL;
@@ -84,10 +85,8 @@ export async function initializeDb(): Promise<void> {
   if (schemaInitialized) return;
 
   if (usePostgres) {
-    // PostgreSQL initialization
-    const schemaPath = path.join(process.cwd(), 'src', 'lib', 'db', 'schema-postgres.sql');
-    const schema = fs.readFileSync(schemaPath, 'utf-8');
-    const statements = schema.split(';').map((s) => s.trim()).filter((s) => s.length > 0);
+    // PostgreSQL initialization - use embedded schema to avoid filesystem access in production
+    const statements = POSTGRES_SCHEMA.split(';').map((s) => s.trim()).filter((s) => s.length > 0);
     for (const statement of statements) {
       await sql!.unsafe(statement);
     }
