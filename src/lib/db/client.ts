@@ -76,6 +76,16 @@ function saveSqliteDb() {
   }
 }
 
+// Refresh SQLite database from disk (for multi-worker concurrency)
+async function refreshSqliteFromDisk(): Promise<void> {
+  if (usePostgres || !SQL) return;
+
+  if (fs.existsSync(DB_PATH)) {
+    const buffer = fs.readFileSync(DB_PATH);
+    sqliteDb = new SQL.Database(buffer);
+  }
+}
+
 // ============================================================================
 // Initialization
 // ============================================================================
@@ -197,17 +207,6 @@ export async function createSource(data: {
 export async function getSource(id: string): Promise<Source | null> {
   await initializeDb();
 
-  const query = `
-    SELECT s.*,
-           COUNT(DISTINCT ml.id) as lesson_count,
-           COUNT(DISTINCT f.id) as card_count
-    FROM sources s
-    LEFT JOIN micro_lessons ml ON ml.source_id = s.id
-    LEFT JOIN flashcards f ON f.lesson_id = ml.id
-    WHERE s.id = ${usePostgres ? '$1' : '?'}
-    GROUP BY s.id
-  `;
-
   if (usePostgres) {
     const rows = await sql!`
       SELECT s.*,
@@ -222,7 +221,8 @@ export async function getSource(id: string): Promise<Source | null> {
     if (rows.length === 0) return null;
     return rowToSource(rows[0] as Record<string, unknown>);
   } else {
-    const rows = sqliteGetAll(
+    // First attempt
+    let rows = sqliteGetAll(
       `SELECT s.*, COUNT(DISTINCT ml.id) as lesson_count, COUNT(DISTINCT f.id) as card_count
        FROM sources s
        LEFT JOIN micro_lessons ml ON ml.source_id = s.id
@@ -231,6 +231,21 @@ export async function getSource(id: string): Promise<Source | null> {
        GROUP BY s.id`,
       [id]
     );
+
+    // If not found, refresh from disk in case another worker created it
+    if (rows.length === 0) {
+      await refreshSqliteFromDisk();
+      rows = sqliteGetAll(
+        `SELECT s.*, COUNT(DISTINCT ml.id) as lesson_count, COUNT(DISTINCT f.id) as card_count
+         FROM sources s
+         LEFT JOIN micro_lessons ml ON ml.source_id = s.id
+         LEFT JOIN flashcards f ON f.lesson_id = ml.id
+         WHERE s.id = ?
+         GROUP BY s.id`,
+        [id]
+      );
+    }
+
     if (rows.length === 0) return null;
     return rowToSource(rows[0]);
   }
