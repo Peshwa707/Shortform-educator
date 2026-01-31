@@ -9,6 +9,9 @@ export interface Source {
   originalUrl?: string;
   filePath?: string;
   rawText?: string;
+  processingStatus?: string;
+  processingProgress?: number;
+  errorMessage?: string;
   processedAt?: Date;
   createdAt: Date;
   // Computed fields

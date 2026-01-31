@@ -1453,6 +1453,11 @@ function rowToSource(row: Record<string, unknown>): Source {
     originalUrl: row.original_url as string | undefined,
     filePath: row.file_path as string | undefined,
     rawText: row.raw_text as string | undefined,
+    processingStatus: row.processing_status as string | undefined,
+    processingProgress: row.processing_progress !== null && row.processing_progress !== undefined
+      ? Number(row.processing_progress)
+      : undefined,
+    errorMessage: row.error_message as string | undefined,
     processedAt: row.processed_at ? new Date(row.processed_at as string) : undefined,
     createdAt: new Date(row.created_at as string),
     // Fix: Don't convert 0 to undefined - properly check for null/undefined
